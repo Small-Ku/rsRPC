@@ -1,10 +1,14 @@
 use aho_corasick::{AhoCorasick, PatternID};
+#[cfg(target_os = "windows")]
+use serde::Deserialize;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 use std::vec;
+#[cfg(target_os = "windows")]
+use wmi::{COMLibrary, WMIConnection};
 
 use crate::log;
 use crate::ProcessCallback;
@@ -31,6 +35,31 @@ pub struct Exec {
 #[derive(Clone)]
 pub struct ProcessDetectedEvent {
   pub activity: DetectableActivity,
+}
+
+#[cfg(target_os = "windows")]
+#[allow(non_camel_case_types)]
+#[allow(non_snake_case)]
+#[derive(Deserialize, Debug)]
+struct Win32_Process {
+  Name: String,
+  CommandLine: Option<String>,
+  ExecutablePath: Option<String>,
+  ProcessId: u32,
+}
+
+#[cfg(target_os = "windows")]
+#[allow(non_snake_case)]
+#[derive(Deserialize, Debug)]
+struct __InstanceCreationEvent {
+  TargetInstance: Win32_Process,
+}
+
+#[cfg(target_os = "windows")]
+#[allow(non_snake_case)]
+#[derive(Deserialize, Debug)]
+struct __InstanceDeletionEvent {
+  TargetInstance: Win32_Process,
 }
 
 #[derive(Clone)]
@@ -204,8 +233,149 @@ impl ProcessServer {
           // Set the detected list to the new list
           *clone.detected_list.lock().unwrap() = detected;
         }
-
         std::thread::sleep(wait_time);
+
+        #[cfg(target_os = "windows")]
+        break; // Windows uses WMI events, so no need to loop here
+      }
+    });
+
+    let clone = self.clone();
+    #[cfg(target_os = "windows")]
+    std::thread::spawn(move || {
+      // Initialize WMI event watchers
+      let con = wmi::WMIConnection::new(wmi::COMLibrary::new().unwrap()).unwrap();
+      let mut filters = std::collections::HashMap::new();
+      filters.insert(
+        "TargetInstance".to_owned(),
+        wmi::FilterValue::is_a::<Win32_Process>().unwrap(),
+      );
+      let mut create_watcher = con
+        .filtered_notification::<__InstanceCreationEvent>(&filters, Some(wait_time))
+        .unwrap();
+
+      loop {
+        if let Some(proc) = match create_watcher.next() {
+          Some(Ok(event)) => Some(event.TargetInstance),
+          Some(Err(err)) => {
+            log!("[Process Scanner] WMI InstanceCreationEvent Error: {}", err);
+            None
+          }
+          None => None,
+        } {
+          if let Ok(exec) = win_process_to_exec(&proc) {
+            if let Some(detected) = clone.scan_process(exec) {
+              let mut detected_list = clone.detected_list.lock().unwrap();
+              if detected_list.is_empty() {
+                clone
+                  .event_sender
+                  .send(ProcessDetectedEvent {
+                    activity: detected.clone(),
+                  })
+                  .unwrap();
+              }
+              detected_list.push(detected);
+              log!(
+                "[Process Scanner] WMI InstanceCreationEvent: {:?}[{:?}]\n{:?}",
+                proc.Name,
+                proc.ProcessId,
+                detected_list
+                  .iter()
+                  .map(|x| (x.name.clone(), x.pid.unwrap_or(0)))
+                  .collect::<Vec<_>>()
+              );
+            }
+          }
+        };
+      }
+    });
+
+    let clone = self.clone();
+    #[cfg(target_os = "windows")]
+    std::thread::spawn(move || {
+      // Initialize WMI event watchers
+      let con = wmi::WMIConnection::new(wmi::COMLibrary::new().unwrap()).unwrap();
+      let mut filters = std::collections::HashMap::new();
+      filters.insert(
+        "TargetInstance".to_owned(),
+        wmi::FilterValue::is_a::<Win32_Process>().unwrap(),
+      );
+      let mut delete_watcher = con
+        .filtered_notification::<__InstanceDeletionEvent>(&filters, Some(wait_time))
+        .unwrap();
+
+      loop {
+        if let Some(proc) = match delete_watcher.next() {
+          Some(Ok(event)) => Some(event.TargetInstance),
+          Some(Err(err)) => {
+            log!("[Process Scanner] WMI InstanceDeletionEvent Error: {}", err);
+            None
+          }
+          None => None,
+        } {
+          let mut detected_list = clone.detected_list.lock().unwrap();
+          if detected_list.is_empty() {
+            continue;
+          }
+          if let Ok(exec) = win_process_to_exec(&proc) {
+            detected_list.retain(|x| x.pid.is_some_and(|p| p != exec.pid));
+            log!(
+              "[Process Scanner] WMI InstanceDeletionEvent: {:?}[{:?}]\n{:?}",
+              proc.Name,
+              proc.ProcessId,
+              detected_list
+                .iter()
+                .map(|x| (x.name.clone(), x.pid.unwrap_or(0)))
+                .collect::<Vec<_>>()
+            );
+            if detected_list.is_empty() {
+              clone
+                .event_sender
+                .send(ProcessDetectedEvent {
+                  activity: DetectableActivity {
+                    bot_public: None,
+                    bot_require_code_grant: None,
+                    cover_image: None,
+                    description: None,
+                    developers: None,
+                    executables: None,
+                    flags: None,
+                    guild_id: None,
+                    hook: false,
+                    icon: None,
+                    id: "null".to_string(),
+                    name: "".to_string(),
+                    publishers: None,
+                    rpc_origins: None,
+                    splash: None,
+                    third_party_skus: None,
+                    type_field: None,
+                    verify_key: None,
+                    primary_sku_id: None,
+                    slug: None,
+                    aliases: None,
+                    overlay: None,
+                    overlay_compatibility_hook: None,
+                    privacy_policy_url: None,
+                    terms_of_service_url: None,
+                    eula_id: None,
+                    deeplink_uri: None,
+                    tags: None,
+                    pid: None,
+                    timestamp: None,
+                  },
+                })
+                .unwrap();
+            } else {
+              clone
+                .event_sender
+                .send(ProcessDetectedEvent {
+                  activity: detected_list[0].clone(),
+                })
+                .unwrap();
+            }
+          }
+        };
       }
     });
   }
@@ -245,89 +415,13 @@ impl ProcessServer {
 
   #[cfg(target_os = "windows")]
   pub fn process_list() -> Result<Vec<Exec>, Box<dyn std::error::Error>> {
-    use serde::Deserialize;
-    use wmi::{COMLibrary, WMIConnection};
-
     let con = WMIConnection::new(COMLibrary::new()?)?;
-
-    #[allow(non_camel_case_types)]
-    #[allow(non_snake_case)]
-    #[derive(Deserialize, Debug)]
-    struct Win32_Process {
-      Name: String,
-      CommandLine: Option<String>,
-      ExecutablePath: Option<String>,
-      ProcessId: u32,
-    }
-
-    fn get_process_path(pid: u32) -> Option<String> {
-      use windows::Win32::Foundation::CloseHandle;
-      use windows::Win32::System::ProcessStatus::GetModuleFileNameExW;
-      use windows::Win32::System::Threading::{
-        OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
-      };
-      unsafe {
-        // Open the process with necessary access rights
-        if let Ok(process_handle) = OpenProcess(
-          PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
-          false,
-          pid,
-        )
-        .or(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid))
-        {
-          // Buffer to store the file name
-          let mut filename_buf = [0u16; 260]; // MAX_PATH is typically 260
-
-          // Get the module file name
-          let filename_len = GetModuleFileNameExW(Some(process_handle), None, &mut filename_buf);
-
-          // Close the process handle
-          let _ = CloseHandle(process_handle);
-
-          if filename_len == 0 {
-            return None;
-          }
-
-          // Convert the UTF-16 buffer to a Rust String
-          let path = String::from_utf16_lossy(&filename_buf[..filename_len as usize]);
-          Some(path)
-        } else {
-          None
-        }
-      }
-    }
-
     let procs: Vec<Win32_Process> = con.query()?;
 
-    let mut processes = Vec::new();
-
-    for proc in procs {
-      let pid = proc.ProcessId as u64;
-      let (mut path, arguments) = proc
-        .CommandLine
-        .clone()
-        .map(|x| {
-          if let Some(args) = shlex::split(&x) {
-            if !args.is_empty() {
-              return (Some(args[0].clone()), Some(args[1..].join(" ")));
-            }
-          }
-          (None, None)
-        })
-        .unwrap_or((None, None));
-
-      if proc.ExecutablePath.is_some() {
-        path = proc.ExecutablePath.clone();
-      } else if let Some(_path) = get_process_path(proc.ProcessId) {
-        path = Some(_path);
-      }
-
-      processes.push(Exec {
-        pid,
-        path: path.unwrap_or(format!("\\{}", proc.Name)),
-        arguments,
-      });
-    }
+    let processes = procs
+      .iter()
+      .filter_map(|p| win_process_to_exec(p).ok())
+      .collect::<Vec<Exec>>();
 
     Ok(processes)
   }
@@ -390,69 +484,15 @@ impl ProcessServer {
 
     let process_scan_state = Mutex::new(ProcessScanState::default());
 
-    let ac = self.detectable_ac.lock().unwrap();
-    let custom_ac = self.custom_detectable_ac.lock().unwrap();
-
     let mut detected_list: Vec<DetectableActivity> = processes
       .iter()
       .filter_map(|process| {
-        // Process path (but consistent slashes, so we can compare properly)
-        let process_path = process.path.to_lowercase().replace('\\', "/");
-
+        let process_path = process.path.to_lowercase();
         if process_path.contains("obs64") || process_path.contains("streamlabs") {
           process_scan_state.lock().unwrap().obs_open = true;
         }
 
-        // Aho-Corasick matching
-        let reversed_path: String = process_path.chars().rev().collect();
-        let (obj, exe_index) = if let Some(mat) = ac.find(&reversed_path) {
-          let pattern_id: PatternID = mat.pattern();
-          let exe_index = self.detectable_indexes.lock().unwrap()[pattern_id.as_usize()];
-          (&self.detectable_list[exe_index[0]], exe_index[1])
-        } else if custom_ac.is_some() {
-          let custom_ac = custom_ac.as_ref().unwrap();
-          if let Some(mat) = custom_ac.find(&reversed_path) {
-            let pattern_id: PatternID = mat.pattern();
-            let exe_index = self.custom_detectable_indexes.lock().unwrap()[pattern_id.as_usize()];
-            (
-              &self.custom_detectables.lock().unwrap()[exe_index[0]],
-              exe_index[1],
-            )
-          } else {
-            return None;
-          }
-        } else {
-          return None;
-        };
-
-        // Argument checks
-        let mut new_activity = obj.clone();
-        let executable = &obj.executables.as_ref().unwrap()[exe_index];
-
-        if let Some(exec_args) = &executable.arguments {
-          // Only require argument checks if executable starts with '>'
-          // like Minecraft: { arguments: "net.minecraft.client.main.Main", is_launcher: false, name: ">java", … }
-          // Other games might provide arguments but not necessary be checked
-          // like Left 4 Dead 2: { arguments: "-game left4dead2", is_launcher: false, name: "left 4 dead 2/left4dead2.exe", … }
-          if executable.name.starts_with(">")
-            && !process
-              .arguments
-              .as_ref()
-              .is_some_and(|args| args.contains(exec_args))
-          {
-            return None;
-          }
-        }
-
-        new_activity.pid = Some(process.pid);
-        new_activity.timestamp = Some(format!(
-          "{:?}",
-          std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis()
-        ));
-        Some(new_activity)
+        self.scan_process(process.clone())
       })
       .collect();
 
@@ -471,6 +511,66 @@ impl ProcessServer {
     log!("[Process Scanner] Process scan complete");
 
     Ok(detected_list)
+  }
+
+  fn scan_process(&self, process: Exec) -> Option<DetectableActivity> {
+    let ac = self.detectable_ac.lock().unwrap();
+    let custom_ac = self.custom_detectable_ac.lock().unwrap();
+
+    // Process path (but consistent slashes, so we can compare properly)
+    let process_path = process.path.to_lowercase().replace('\\', "/");
+
+    // Aho-Corasick matching
+    let reversed_path: String = process_path.chars().rev().collect();
+    let (obj, exe_index) = if let Some(mat) = ac.find(&reversed_path) {
+      let pattern_id: PatternID = mat.pattern();
+      let exe_index = self.detectable_indexes.lock().unwrap()[pattern_id.as_usize()];
+      (&self.detectable_list[exe_index[0]], exe_index[1])
+    } else if custom_ac.is_some() {
+      let custom_ac = custom_ac.as_ref().unwrap();
+      if let Some(mat) = custom_ac.find(&reversed_path) {
+        let pattern_id: PatternID = mat.pattern();
+        let exe_index = self.custom_detectable_indexes.lock().unwrap()[pattern_id.as_usize()];
+        (
+          &self.custom_detectables.lock().unwrap()[exe_index[0]],
+          exe_index[1],
+        )
+      } else {
+        return None;
+      }
+    } else {
+      return None;
+    };
+
+    // Argument checks
+    let mut new_activity = obj.clone();
+    let executable = &obj.executables.as_ref().unwrap()[exe_index];
+
+    if let Some(exec_args) = &executable.arguments {
+      // Only require argument checks if executable starts with '>'
+      // like Minecraft: { arguments: "net.minecraft.client.main.Main", is_launcher: false, name: ">java", … }
+      // Other games might provide arguments but not necessary be checked
+      // like Left 4 Dead 2: { arguments: "-game left4dead2", is_launcher: false, name: "left 4 dead 2/left4dead2.exe", … }
+      if executable.name.starts_with(">") {
+        if !process
+          .arguments
+          .as_ref()
+          .is_some_and(|args| args.contains(exec_args))
+        {
+          return None;
+        }
+      }
+    }
+
+    new_activity.pid = Some(process.pid);
+    new_activity.timestamp = Some(format!(
+      "{:?}",
+      std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+    ));
+    Some(new_activity)
   }
 }
 
@@ -502,6 +602,72 @@ fn build_ac_patterns(detectables: &[DetectableActivity]) -> (AhoCorasick, Vec<[u
   }
 
   (AhoCorasick::new(exe_patterns).unwrap(), exe_indexes)
+}
+
+#[cfg(target_os = "windows")]
+fn win_process_to_exec(proc: &Win32_Process) -> Result<Exec, Box<dyn std::error::Error>> {
+  fn get_process_path(pid: u32) -> Option<String> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::ProcessStatus::GetModuleFileNameExW;
+    use windows::Win32::System::Threading::{
+      OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
+    };
+    unsafe {
+      // Open the process with necessary access rights
+      if let Ok(process_handle) = OpenProcess(
+        PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
+        false,
+        pid,
+      )
+      .or(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid))
+      {
+        // Buffer to store the file name
+        let mut filename_buf = [0u16; 260]; // MAX_PATH is typically 260
+
+        // Get the module file name
+        let filename_len = GetModuleFileNameExW(Some(process_handle), None, &mut filename_buf);
+
+        // Close the process handle
+        let _ = CloseHandle(process_handle);
+
+        if filename_len == 0 {
+          return None;
+        }
+
+        // Convert the UTF-16 buffer to a Rust String
+        let path = String::from_utf16_lossy(&filename_buf[..filename_len as usize]);
+        Some(path)
+      } else {
+        None
+      }
+    }
+  }
+
+  let pid = proc.ProcessId as u64;
+  let (mut path, arguments) = proc
+    .CommandLine
+    .clone()
+    .map(|x| {
+      if let Some(args) = shlex::split(&x) {
+        if !args.is_empty() {
+          return (Some(args[0].clone()), Some(args[1..].join(" ")));
+        }
+      }
+      (None, None)
+    })
+    .unwrap_or((None, None));
+
+  if proc.ExecutablePath.is_some() {
+    path = proc.ExecutablePath.clone();
+  } else if let Some(_path) = get_process_path(proc.ProcessId) {
+    path = Some(_path);
+  }
+
+  Ok(Exec {
+    pid,
+    path: path.unwrap_or(format!("\\{}", proc.Name)),
+    arguments,
+  })
 }
 
 // pub fn name_no_ext(name: &String) -> String {
